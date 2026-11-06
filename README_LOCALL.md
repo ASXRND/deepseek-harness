@@ -91,6 +91,38 @@ pnpm run build                      # пересобрать артефакты 
 - Версия pnpm зашита в package.json (`"packageManager": "pnpm@11.7.0"`). Не запускать `corepack use ...` — он правит package.json.
 - Проверить, отстал ли репозиторий: `git fetch && git log --oneline HEAD..origin/master | head`
 
+### НЕ запускать `pnpm update`
+
+Апстрим жёстко пинит версии транзитивных зависимостей через `overrides` + `patchedDependencies`
+в `pnpm-workspace.yaml`. `pnpm update` поднимает версии в обход этих ограничений и ломает
+сборку, потому что патчи перестают накладываться. Проверено: `mdast-util-from-markdown`
+уехал с `2.0.3` на `2.1.0` → `TS2769` в `packages/client/ui-primitives/src/markdown/parse.ts`.
+
+Правильный порядок обновления зависимостей — только вместе с кодом:
+
+```sh
+git pull origin master        # новый package.json + pnpm-lock.yaml приезжают вместе с кодом
+pnpm install                  # ставит ровно то, что в lock, и накладывает патчи
+```
+
+Если после `pnpm install` сборка падает на `InstallationProbe` / `ULMO` / «integrity verification» —
+значит патчи не наложились. Признак: каталог `node_modules/.pnpm/<pkg>@<ver>_patch_hash=…` существует,
+но содержимое пакета не пропатчено. Лечение — снести патченные пакеты и переустановить:
+
+```sh
+cd ~/Desktop/development_locall/deepseek-harness
+for p in "app-builder-lib@26.17.0_patch_hash" "@earendil-works+pi-ai@1.3.0" "@electron+osx-sign@1.3.3" \
+         "@fortune-sheet+core@1.0.4" "@fortune-sheet+react@1.0.4" "@yao-pkg+pkg@6.21.0" \
+         "exceljs@4.4.0" "lexical@0.49.0" "mdast-util-gfm-autolink-literal@2.0.1" \
+         "micromark-extension-gfm-autolink-literal@2.1.0" "node-pty@1.2.0-beta.15" "@botiverse+oar@0.67.0_patch_hash"; do
+  find node_modules/.pnpm -maxdepth 1 -name "${p}*" -exec rm -rf {} + 2>/dev/null
+done
+pnpm install
+# проверка, что патчи встали:
+grep -c ULMO node_modules/.pnpm/app-builder-lib@26.17.0_patch_hash=*/node_modules/app-builder-lib/scheme.json   # → 1
+grep -n 'InstallationProbe' packages/experimental/subagent-oar/node_modules/@botiverse/oar/dist/contracts/installation.d.ts  # → с параметром env
+```
+
 ## Запуск
 
 ```sh
@@ -100,6 +132,60 @@ pnpm run demo:acp     # ACP-автоматизация
 ```
 
 API-ключ: root `.env` → `DEEPSEEK_API_KEY` (+ опц. `DEEPSEEK_BASE_URL`). Без ключа e2e-тесты сами скипаются.
+
+## Сборка macOS-приложения (.app)
+
+Собирается Electron-обёртка из `apps/desktop`. На Apple Silicon, неподписанная (ad-hoc),
+без нотаризации — для локального запуска этого достаточно.
+
+```sh
+cd ~/Desktop/development_locall/deepseek-harness
+pnpm run build:artifacts                                    # обязательно до первой сборки
+
+# macOS создаёт .DS_Store внутри runtime-дерева, и проверка целостности на них падает.
+# Поэтому чистим их в фоне, пока идёт сборка:
+nohup bash -c 'while true; do find apps/desktop/.desktop-build -name ".DS_Store" -delete 2>/dev/null; sleep 1; done' > /dev/null 2>&1 &
+CLEANER=$!
+
+pnpm --filter @deepseek-ai/dsh-desktop run package:mac:arm64:unsigned -- --dir
+kill $CLEANER
+```
+
+Результат:
+
+```
+apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/mac-arm64/DeepSeek Harness.app
+```
+
+Положить рядом с другими локальными приложениями и снять quarantine:
+
+```sh
+ditto "apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/mac-arm64/DeepSeek Harness.app" \
+      ~/Desktop/development_locall/"DeepSeek Harness.app"
+xattr -dr com.apple.quarantine ~/Desktop/development_locall/"DeepSeek Harness.app"
+open ~/Desktop/development_locall/"DeepSeek Harness.app"
+```
+
+Важные детали:
+
+- Флаг `--dir` = собрать `.app` без `.dmg`. Без него дополнительно упаковывается образ.
+- Сборка идёт долго (10–20 мин): качает Electron, готовит runtime, гоняет smoke-тесты
+  (CLI-плагины, DOCX/XLSX/PPTX, `dsh web`). Не прерывайте её — остатки ломают
+  следующую попытку проверкой целостности.
+- `host aggregate check` внутри сборки типизирует тесты. Если падает на чужих тестах
+  после `git pull` — берите их версии из `origin/master`, свои правки накладывайте сверху.
+- `.app` весит ~1 ГБ, собирается из уже собранных артефактов — после правок в
+  `packages/*` пересоберите `build:artifacts` и повторите.
+
+### Если сборка упала
+
+| Ошибка | Причина | Лечение |
+|---|---|---|
+| `configuration.dmg.format should be one of these` | патч `app-builder-lib` не наложен (нет `ULMO` в схеме) | переустановить патченные пакеты (см. раздел про `pnpm update`) |
+| `Expected 0 arguments, but got 1` в `subagent-oar` | патч `@botiverse/oar` не наложен | то же |
+| `desktop runtime: integrity verification failed` | macOS создал `.DS_Store` в runtime-дереве | чистить в фоне во время сборки (см. выше) |
+| `error TS2339: Property 'details' does not exist` | тесты в апстриме отстали от типов | взять тесты из `origin/master` |
+| `desktop version X does not match dsh version Y` | `package.json` откачен не к тому коммиту | `git checkout origin/master -- package.json pnpm-lock.yaml && pnpm install` |
 
 ## Команды, которые могут пригодиться
 
